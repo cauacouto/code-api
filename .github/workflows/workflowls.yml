@@ -1,69 +1,75 @@
-name: CI/CD with Docker and GitHub Actions
+name: Build and Deploy Codechella
 
 on:
   push:
     branches:
       - main
 
-permissions:
-  contents: read
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build and Push
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Baixar o código do repositório
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Configurar o Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Autenticar no Docker Hub
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            -t "${{ secrets.DOCKERHUB_USERNAME }}/codechella:latest" .
+      # 4. Construir e enviar a imagem para o Docker Hub
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/codechella:latest
 
-      - name: Push Docker image
-        run: |
-          docker push \
-            "${{ secrets.DOCKERHUB_USERNAME }}/codechella:latest"
-
-  deploy:
-    name: Deploy to EC2
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install SSH key
+      # 5. Configurar a chave SSH privada
+      - name: Set up SSH agent
         uses: webfactory/ssh-agent@v0.9.1
         with:
           ssh-private-key: ${{ secrets.PRIVATE_KEY }}
 
-      - name: Prepare environment file
+      # 6. Registrar a chave pública da EC2
+      - name: Add EC2 to known_hosts
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+          chmod 600 ~/.ssh/known_hosts
+
+      # 7. Gerar o arquivo .env com os GitHub Secrets
+      - name: Generate environment file
         env:
           HOST_DATABASE: ${{ secrets.HOST_DATABASE }}
-          USER_DB: ${{ secrets.USER_DB }}
+          DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           MAIL_HOST: ${{ secrets.MAIL_HOST }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
-          python3 - <<'PY'
+          python3 <<'PY'
           import os
-          from pathlib import Path
 
           names = [
               "HOST_DATABASE",
-              "USER_DB",
+              "DB_USER",
               "DB_PASSWORD",
               "MAIL_HOST",
               "MAIL_USER",
@@ -71,64 +77,77 @@ jobs:
               "JWT_SECRET",
           ]
 
-          missing = [name for name in names if not os.environ.get(name)]
-          if missing:
-              raise SystemExit(
-                  "GitHub Secrets ausentes ou vazios: " + ", ".join(missing)
-              )
+          with open(".env", "w", encoding="utf-8") as file:
+              for name in names:
+                  value = os.environ.get(name)
 
-          def escape(value):
-              return (
-                  value.replace("\\", "\\\\")
-                       .replace('"', '\\"')
-                       .replace("$", "\\$")
-                       .replace("`", "\\`")
-              )
+                  if value is None or value == "":
+                      raise ValueError(
+                          f"A variável obrigatória {name} está vazia."
+                      )
 
-          content = "".join(
-              f'{name}="{escape(os.environ[name])}"\n'
-              for name in names
-          )
+                  # Aspas simples evitam interpolação de $ no .env.
+                  # Escapamos apóstrofos para preservar o valor.
+                  value = value.replace("'", "\\'")
 
-          path = Path(".env")
-          path.write_text(content)
-          path.chmod(0o600)
+                  file.write(f"{name}='{value}'\n")
+
+          os.chmod(".env", 0o600)
           PY
 
+      # 8. Verificar se o Docker Compose existe
+      - name: Check Docker Compose configuration
+        run: docker compose config --quiet
+
+      # 9. Criar o diretório da aplicação na EC2
+      - name: Create deployment directory
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            ubuntu@"$EC2_HOST" \
+            'mkdir -p /home/ubuntu/codechella'
+
+      # 10. Copiar o Compose e o .env para a EC2
       - name: Copy deployment files to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          ssh \
-            -o StrictHostKeyChecking=yes \
-            -o ConnectTimeout=15 \
-            ubuntu@"$EC2_HOST" \
-            "mkdir -p /home/ubuntu/codechella"
-
           scp \
             -o StrictHostKeyChecking=yes \
-            docker-compose.yml .env \
+            docker-compose.yml \
+            .env \
             ubuntu@"$EC2_HOST":/home/ubuntu/codechella/
 
-      - name: Deploy application
+      # 11. Baixar a imagem atualizada e executar o deploy
+      - name: Deploy on EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           ssh \
             -o StrictHostKeyChecking=yes \
-            ubuntu@"$EC2_HOST" '
+            ubuntu@"$EC2_HOST" <<'SSH'
               set -e
+
               cd /home/ubuntu/codechella
 
-              chmod 600 .env
-
+              echo "Baixando a imagem atualizada..."
               docker compose pull app
+
+              echo "Iniciando os containers..."
               docker compose up -d --remove-orphans
 
+              echo "Removendo imagens antigas não utilizadas..."
               docker image prune -f
-              docker compose ps
-          '
 
-      - name: Clean up local environment file
+              echo "Verificando os containers..."
+              docker compose ps
+
+              echo "Deploy concluído!"
+          SSH
+
+      # 12. Remover o .env do runner do GitHub Actions
+      - name: Cleanup
         if: always()
         run: rm -f .env
