@@ -65,7 +65,6 @@ jobs:
               "HOST_DATABASE",
               "USER_DB",
               "DB_PASSWORD",
-              "MYSQL_ROOT_PASSWORD",
               "MAIL_HOST",
               "MAIL_USER",
               "MAIL_PASSWORD",
