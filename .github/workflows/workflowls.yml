@@ -52,7 +52,6 @@ jobs:
           HOST_DATABASE: ${{ secrets.HOST_DATABASE }}
           USER_DB: ${{ secrets.USER_DB }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
           MAIL_HOST: ${{ secrets.MAIL_HOST }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
