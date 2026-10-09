@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+    name: Build and Push
     runs-on: ubuntu-latest
 
     steps:
@@ -25,14 +26,15 @@ jobs:
       - name: Build Docker image
         run: |
           docker build \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/codechella:latest .
+            -t "${{ secrets.DOCKERHUB_USERNAME }}/codechella:latest" .
 
       - name: Push Docker image
         run: |
           docker push \
-            ${{ secrets.DOCKERHUB_USERNAME }}/codechella:latest
+            "${{ secrets.DOCKERHUB_USERNAME }}/codechella:latest"
 
   deploy:
+    name: Deploy to EC2
     runs-on: ubuntu-latest
     needs: build
 
@@ -47,48 +49,86 @@ jobs:
 
       - name: Prepare environment file
         env:
-          MYSQL_DATABASE: ${{ secrets.HOST_DATABASE }}
-          MYSQL_USER: ${{ secrets.USER_DB }}
-          MYSQL_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          MAIL_HOST: ${{MAIL_HOST}}
-          MAIL_USER: ${{MAIL_USER}}
-          MAIL_PASSWORD: ${{MAIL_PASSWORD}}
-          JWT_SECRET: ${{JWT_SECRET}}
-
-
+          HOST_DATABASE: ${{ secrets.HOST_DATABASE }}
+          USER_DB: ${{ secrets.USER_DB }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
-          umask 077
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
 
-          printf "MYSQL_DATABASE='%s'\n" "$MYSQL_DATABASE" > .env
-          printf "MYSQL_USER='%s'\n" "$MYSQL_USER" >> .env
-          printf "MYSQL_PASSWORD='%s'\n" "$MYSQL_PASSWORD" >> .env
-          printf "MYSQL_ROOT_PASSWORD='%s'\n" "$MYSQL_ROOT_PASSWORD" >> .env
+          names = [
+              "HOST_DATABASE",
+              "USER_DB",
+              "DB_PASSWORD",
+              "MYSQL_ROOT_PASSWORD",
+              "MAIL_HOST",
+              "MAIL_USER",
+              "MAIL_PASSWORD",
+              "JWT_SECRET",
+          ]
+
+          missing = [name for name in names if not os.environ.get(name)]
+          if missing:
+              raise SystemExit(
+                  "GitHub Secrets ausentes ou vazios: " + ", ".join(missing)
+              )
+
+          def escape(value):
+              return (
+                  value.replace("\\", "\\\\")
+                       .replace('"', '\\"')
+                       .replace("$", "\\$")
+                       .replace("`", "\\`")
+              )
+
+          content = "".join(
+              f'{name}="{escape(os.environ[name])}"\n'
+              for name in names
+          )
+
+          path = Path(".env")
+          path.write_text(content)
+          path.chmod(0o600)
+          PY
 
       - name: Copy deployment files to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          ssh -o StrictHostKeyChecking=no \
-            ubuntu@$EC2_HOST \
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            ubuntu@"$EC2_HOST" \
             "mkdir -p /home/ubuntu/codechella"
 
-          scp docker-compose.yml .env \
-            ubuntu@$EC2_HOST:/home/ubuntu/codechella/
+          scp \
+            -o StrictHostKeyChecking=yes \
+            docker-compose.yml .env \
+            ubuntu@"$EC2_HOST":/home/ubuntu/codechella/
 
       - name: Deploy application
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_HOST '
-            set -e
-            cd /home/ubuntu/codechella
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            ubuntu@"$EC2_HOST" '
+              set -e
+              cd /home/ubuntu/codechella
 
-            chmod 600 .env
+              chmod 600 .env
 
-            docker compose pull app
-            docker compose up -d --remove-orphans
+              docker compose pull app
+              docker compose up -d --remove-orphans
 
-            docker image prune -f
+              docker image prune -f
+              docker compose ps
           '
 
       - name: Clean up local environment file
